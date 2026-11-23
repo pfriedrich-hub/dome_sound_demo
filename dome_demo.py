@@ -100,8 +100,10 @@ LOOP_RAMP = 0.005       # s, raised-cosine ramp at both ends of each sound, so t
 # ======================================================
 
 # Fixed in the circuit -- these must match it (see the docstring):
-SAMPLERATE = 48828      # the wavs are 22.05 kHz (content up to 11 kHz); at 24414 Hz the
-                        # RX8 DAC filter would already roll off near 11 kHz
+SAMPLERATE = 24414      # the wavs are 22.05 kHz (content up to 11 kHz); 24414 Hz keeps it
+                        # (the DAC filter may roll off slightly at the very top) and costs
+                        # half the DSP load of 48828 Hz
+# The rate is the one stored in the .rcx (RPvdsEx device setup); init_processors checks it.
 N_MOVING = 2            # buffers 1..2 on both RX8s: sigin, len, aSig{i}_Ch1..24
                         # (3 x 24 gain cells do not fit on two 2-DSP RX8s: >256 components/DSP)
 N_CHANNELS = 24         # aSig{i}_Ch1..24
@@ -109,7 +111,8 @@ STATIC_WIRING = {       # static buffer -> the DAC channel it is wired to in tha
     'RX81': {4: 11, 5: 4, 6: 20, 7: 8, 8: 21},   # chimes, chimes2, chimes3, cat, motor (3 unused)
     'RX82': {3: 14, 4: 18, 5: 2},                  # train_s, ocean, cows
 }
-BUFFER_SIZE = 2100000   # SerSource Size; cows.wav (42 s) is the longest sound: 2.05 M at 48828 Hz
+BUFFER_SIZE = 2100000   # SerialBuf Size in the circuits; cows.wav (42 s), the longest sound, needs
+                        # 1.03 M at 24414 Hz (2.05 M at 48828 Hz)
 RCX_FILES = {'RX81': 'scene_RX81.rcx', 'RX82': 'scene_RX82.rcx'}
 RCX_DIR = Path(__file__).resolve().parent / 'rcx'
 PROCESSOR_MODE = 'dome_demo'
