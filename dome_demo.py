@@ -15,17 +15,23 @@ only the moving sounds get a gain on every channel, static sounds get one gain
 and a channel that is wired in the circuit.
 
     buffers 1..N_MOVING (both RX8s) -- moving sounds
-      sigin{i}         SerSource buffer, Size = BUFFER_SIZE, loops
-      len{i}           buffer i wraps back to 0 after len{i} samples
+      sigin{i}         SerialBuf, fixed Size = BUFFER_SIZE, wraps at Size (as in Marc's circuit).
+                       The script fills the whole buffer with repetitions of the sound, so it
+                       loops at its own length; at the wrap (every BUFFER_SIZE samples, 45 s at
+                       24414 Hz) the last repetition is cut short and faded out.
       aSig{i}_Ch{c}    gain of buffer i on channel c = 1..24, smoothed (as in Marc's circuit)
     buffers in STATIC_WIRING (per RX8) -- static sounds
-      sigin{i}, len{i} as above
+      sigin{i} as above
       amp{i}           gain of buffer i, smoothed; output added to ONE channel, wired in the circuit
     per channel c      sum of everything routed to c -> one DacOut c
                        (one DacOut per channel: TDT does not document what two DacOuts
                        on the same channel do)
     zBusA (level)      SerialBuf AccEnab: high = play, low = stop (as in Marc's circuit)
     zBusB              SerialBuf Rst: a pulse resets every buffer index to 0
+
+A hopping sound (cat, cows) is a static buffer wired to several channels, each through
+its own gain amp{i}_Ch{c}; the script opens one of them per call, so every call comes
+from one speaker and the next call from another.
 
 STATIC_WIRING is the wiring of the static buffers; the script checks every static
 sound against it. A static sound on a speaker that has no wired buffer can be made
@@ -68,9 +74,58 @@ def orbit(center, radius, period):
     return path
 
 
+# %% hopping -- a sound that plays every call (meow, moo, ...) from one speaker of a set and
+# jumps to another speaker in the pause before the next call. The circuit feeds its buffer to
+# each of these speakers through its own gain (amp{i}_Ch{c}); no panning, no smearing.
+class Hop:
+    def __init__(self, positions, choose):
+        self.positions = positions    # [(azimuth, elevation), ...] -- all on the same RX8
+        self.choose = choose          # choose(current index, positions, rng) -> next index
+
+
+class Spread:
+    """A static sound played from several speakers at once (equal power), e.g. a wide surf."""
+    def __init__(self, positions):
+        self.positions = positions    # [(azimuth, elevation), ...] -- all on the same RX8
+
+
+def wander(max_jump=40, p_up=0.6, p_drop=0.15):
+    """Random jumps to a speaker up to `max_jump` deg away -- upwards with probability `p_up` --
+    and now and then (`p_drop`) a drop back to the lowest row."""
+    def choose(current, positions, rng):
+        vectors = _unit_vectors(*numpy.array(positions, dtype=float).T)
+        angle = numpy.degrees(numpy.arccos(numpy.clip(vectors @ vectors[current], -1, 1)))
+        elevation = numpy.array([el for _, el in positions])
+        others = numpy.arange(len(positions)) != current
+        if rng.random() < p_drop:
+            lowest = numpy.flatnonzero(others & (elevation == elevation[others].min()))
+            return int(rng.choice(lowest))
+        near = numpy.flatnonzero(others & (angle <= max_jump))
+        up = near[elevation[near] > elevation[current]]
+        if len(up) and rng.random() < p_up:
+            return int(rng.choice(up))
+        return int(rng.choice(near if len(near) else numpy.flatnonzero(others)))
+    return choose
+
+
+def scatter():
+    """Each call from a random other speaker of the set."""
+    def choose(current, positions, rng):
+        return int(rng.choice([k for k in range(len(positions)) if k != current]))
+    return choose
+
+
 # ==================== quick config ====================
 # Static sounds: wav file, (azimuth, elevation) of the dome speaker, level in dB.
+# Hopping sounds: wav file, a Hop (speakers + jump rule, see above), level in dB.
 # Moving sounds: wav file, a path from the functions above, level in dB.
+# Optional 4th element, a dict of options:
+#   'gap': (min, max)      seconds of silence after each repetition of the sound in its buffer,
+#                          drawn at random -- a short call then does not repeat at a fixed rhythm.
+#   'snippet': (min, max)  instead of the whole file, play random excerpts of min..max s
+#                          (faded in and out), each followed by a 'gap'.
+# A file can appear more than once (e.g. at several speakers); every copy gets its own
+# random excerpts and pauses.
 # The level is the ACTIVE level: the RMS over the parts where the sound is on (100 ms
 # windows less than ACTIVE_RANGE dB below the loudest one), not over the whole file --
 # the cat is silent ~80 % of its file, so its plain RMS is ~7 dB below its meows.
@@ -78,17 +133,35 @@ def orbit(center, radius, period):
 # These levels are a starting point -- balance them by ear in the dome with the
 # console (e.g. '6 -2'), then copy the values the console prints back here.
 SOUND_DIR = Path(__file__).resolve().parent / 'sounds'   # wav paths are relative to this
+BIRDS = {'snippet': (2, 5), 'gap': (8, 25)}               # options shared by the five bird copies
+MOVE_PERIOD = 90        # s, one round trip of geese and train (one crossing = half of it)
+CAT = Hop([(-35, -37.5), (-35, -25), (-35, -12.5), (-35, 0), (-35, 12.5), (-35, 25), (-35, 37.5),
+           (-52.5, -12.5), (-52.5, 0), (-17.5, -37.5), (-17.5, -25), (-17.5, -12.5)],
+          wander(max_jump=40, p_up=0.6, p_drop=0.15))   # left: climbs, jumps, drops down
+COWS = Hop([(0, -25), (17.5, -25), (35, -25),                # the pen, right and below:
+            (0, -12.5), (17.5, -12.5), (35, -12.5)], scatter())  # each moo from another cow
+SURF = Spread([(0, -50), (0, -37.5), (17.5, -37.5), (35, -37.5)])  # bottom row, centre-right
 SOUNDS = [
-    ('ocean.wav', (-52.5, -25), 58),
-    ('cows.wav', (-35, -12.5), 62),
+    ('ocean.wav', SURF, 52),                                             # spread, low right
     ('chimes.wav', (-17.5, 25), 54),
     ('chimes2.wav', (0, 37.5), 52),
     ('chimes3.wav', (17.5, 25), 53),
-    ('cat.wav', (17.5, -12.5), 52),                                      # target
-    ('motor.wav', (35, -25), 54),
-    ('train_s.wav', (52.5, 0), 53),                                      # far right, on the horizon
-    ('geese.wav', ping_pong((-52.5, 30), (52.5, 30), period=24), 57),    # fly over, left <-> right
-    ('birds.wav', orbit((0, 25), (40, 10), period=30), 56),              # circle up high
+    ('cat.wav', CAT, 52),                                                # target
+    ('cows.wav', COWS, 62),
+    ('motor.wav', (52.5, -12.5), 54),                                    # right, below the horizon
+    # birds: short random excerpts at random times from five places up high, so they
+    # pop up now here, now there (each copy draws its own excerpts and pauses)
+    ('birds.wav', (-52.5, 25), 56, BIRDS),
+    ('birds.wav', (-52.5, 12.5), 56, BIRDS),
+    ('birds.wav', (0, 50), 56, BIRDS),
+    ('birds.wav', (35, 37.5), 56, BIRDS),
+    ('birds.wav', (52.5, 25), 56, BIRDS),
+    # moving: geese fly over left -> right, the train passes slowly in the background
+    # right -> left, along the horizon. Same period, so they always move in opposite
+    # directions (they meet in the middle, then swap sides).
+    ('geese.wav', ping_pong((-52.5, 30), (52.5, 30), period=MOVE_PERIOD), 57,
+     {'gap': (1, 4)}),                                                   # 1-4 s silence between calls
+    ('train_s.wav', ping_pong((52.5, 0), (-52.5, 0), period=MOVE_PERIOD), 50),
     # ('train.wav', ...) -- 184 s: a buffer that long does not fit 8 times into the RX8
     #                       memory; train_s.wav is Marc's trimmed version of it.
 ]
@@ -96,6 +169,9 @@ WIDTH = 30              # deg, FWHM of the Gaussian that pans a moving sound (Ma
 UPDATE_RATE = 10        # Hz, how often the gains of moving sounds are rewritten
 MASTER_GAIN = 0         # dB added to every level -- turns the whole scene up or down
 ACTIVE_RANGE = 30       # dB below the loudest 100 ms window that still counts as 'on'
+GAP_SEED = 1            # random gaps/excerpts are the same on every run (and on both RX8s)
+SNIPPET_FADE = 0.2      # s, fade in/out of each random excerpt
+HOP_PAUSE = 0.4         # s, shorter pauses do not split a call (a hopping sound only jumps in longer ones)
 LOOP_RAMP = 0.005       # s, raised-cosine ramp at both ends of each sound, so the wrap does not click
 # ======================================================
 
@@ -107,12 +183,21 @@ SAMPLERATE = 24414      # the wavs are 22.05 kHz (content up to 11 kHz); 24414 H
 N_MOVING = 2            # buffers 1..2 on both RX8s: sigin, len, aSig{i}_Ch1..24
                         # (3 x 24 gain cells do not fit on two 2-DSP RX8s: >256 components/DSP)
 N_CHANNELS = 24         # aSig{i}_Ch1..24
-STATIC_WIRING = {       # static buffer -> the DAC channel it is wired to in that RX8's circuit
-    'RX81': {4: 11, 5: 4, 6: 20, 7: 8, 8: 21},   # chimes, chimes2, chimes3, cat, motor (3 unused)
-    'RX82': {3: 14, 4: 18, 5: 2},                  # train_s, ocean, cows
+STATIC_WIRING = {       # static buffer -> the DAC channel(s) it is wired to in that RX8's circuit
+    # one channel: gain tag amp{i};  several channels (hopping sound): one gain tag amp{i}_Ch{c} each
+    'RX81': {3: 5,                    # birds (0, 50)
+             4: 11, 5: 4, 6: 20,      # chimes, chimes2, chimes3
+             7: [15, 7, 21, 16, 8, 24],  # cows: az 0 / 17.5 / 35 at el -25 and -12.5
+             8: [13, 14, 6, 22]},     # ocean: az 0 el -50 / -37.5, az 17.5 and 35 el -37.5
+    'RX82': {3: [17, 24, 2, 1, 4, 3, 23,  # cat: az -35, el -37.5 ... 37.5
+                 21, 20,                  #      az -52.5, el -12.5 / 0
+                 5, 8, 7],                #      az -17.5, el -37.5 / -25 / -12.5
+             4: 11,                   # motor (52.5, -12.5)
+             5: 22, 6: 13, 7: 19, 8: 16},  # birds (-52.5, 25), (35, 37.5), (-52.5, 12.5), (52.5, 25)
 }
-BUFFER_SIZE = 2100000   # SerialBuf Size in the circuits; cows.wav (42 s), the longest sound, needs
-                        # 1.03 M at 24414 Hz (2.05 M at 48828 Hz)
+BUFFER_SIZE = 1100000   # SerialBuf Size in the circuits -- must be EXACTLY that value: every buffer is
+                        # filled to it and wraps there (45 s at 24414 Hz). The longest sound, cows.wav
+                        # (42 s), needs 1.03 M at 24414 Hz, so every sound fits at least once.
 RCX_FILES = {'RX81': 'scene_RX81.rcx', 'RX82': 'scene_RX82.rcx'}
 RCX_DIR = Path(__file__).resolve().parent / 'rcx'
 PROCESSOR_MODE = 'dome_demo'
@@ -208,6 +293,62 @@ def _load_sound(file, level):
     return sound
 
 
+def _fill_buffer(data, n_samples=BUFFER_SIZE, gap=None, snippet=None, seed=GAP_SEED):
+    """Repeat `data` until it is `n_samples` long; fade out the cut-off last repetition.
+
+    The circuit's buffers have a fixed Size and wrap there, so a buffer that holds
+    the sound back to back loops seamlessly except at that one wrap point.
+    gap=(min, max): a random min..max s of silence follows each repetition.
+    snippet=(min, max): each repetition is a random min..max s excerpt of `data`.
+    """
+    if snippet is not None:
+        rng = numpy.random.default_rng(seed)
+        n_fade = int(SNIPPET_FADE * SAMPLERATE)
+        fade = numpy.sin(numpy.linspace(0, numpy.pi / 2, n_fade)) ** 2
+        lead = numpy.zeros(int(rng.uniform(0, (gap or (0, 0))[1]) * SAMPLERATE))  # copies start apart
+        pieces, n = [lead], len(lead)
+        while n < n_samples:
+            length = min(len(data), int(rng.uniform(*snippet) * SAMPLERATE))
+            start = rng.integers(0, len(data) - length + 1)
+            piece = data[start:start + length].copy()
+            piece[:n_fade] *= fade
+            piece[-n_fade:] *= fade[::-1]
+            silence = numpy.zeros(int(rng.uniform(*(gap or (0, 0))) * SAMPLERATE))
+            pieces += [piece, silence]
+            n += len(piece) + len(silence)
+        filled = numpy.concatenate(pieces)[:n_samples]
+    elif gap is None:
+        filled = numpy.tile(data, int(numpy.ceil(n_samples / len(data))))[:n_samples]
+    else:
+        rng = numpy.random.default_rng(seed)
+        pieces, n = [], 0
+        while n < n_samples:
+            silence = numpy.zeros(int(rng.uniform(*gap) * SAMPLERATE))
+            pieces += [data, silence]
+            n += len(data) + len(silence)
+        filled = numpy.concatenate(pieces)[:n_samples]
+    n_ramp = max(1, int(LOOP_RAMP * SAMPLERATE))  # fade out whatever is cut at the wrap
+    filled[-n_ramp:] *= numpy.cos(numpy.linspace(0, numpy.pi / 2, n_ramp)) ** 2
+    return filled
+
+
+def _events(data, window=0.05):
+    """(starts, ends) in samples of the calls in `data`: stretches less than ACTIVE_RANGE dB
+    below the loudest 50 ms window, with pauses shorter than HOP_PAUSE bridged."""
+    n_win = max(1, int(window * SAMPLERATE))
+    frames = data[:len(data) // n_win * n_win].reshape(-1, n_win)
+    power = (frames ** 2).mean(axis=1)
+    on = numpy.concatenate([[0], (power >= power.max() * 10 ** (-ACTIVE_RANGE / 10)).astype(int), [0]])
+    starts, ends = numpy.flatnonzero(numpy.diff(on) == 1), numpy.flatnonzero(numpy.diff(on) == -1)
+    keep_s, keep_e = [starts[0]], [ends[0]]
+    for a, b in zip(starts[1:], ends[1:]):
+        if (a - keep_e[-1]) * n_win < HOP_PAUSE * SAMPLERATE:
+            keep_e[-1] = b
+        else:
+            keep_s.append(a); keep_e.append(b)
+    return numpy.array(keep_s) * n_win, numpy.array(keep_e) * n_win
+
+
 # %% demo
 class DomeDemo:
     """Load the sounds in SOUNDS onto the RX8s, loop them, and move the moving ones."""
@@ -217,19 +358,38 @@ class DomeDemo:
         self.speaker_vectors = _unit_vectors(numpy.array([s.azimuth for s in self.table]),
                                              numpy.array([s.elevation for s in self.table]))
         self.sounds = []  # one dict per sound, in the order of SOUNDS
-        for file, where, level in sounds:
+        for n_sound, (file, where, level, *options) in enumerate(sounds):
+            options = options[0] if options else {}
             entry = {'name': Path(file).stem, 'level': level, 'offset': 0.0, 'muted': False,
                      'sound': _load_sound(file, level)}
+            if [f for f, *_ in sounds].count(file) > 1 and not callable(where):
+                entry['name'] += f'@{where[0]:g},{where[1]:g}'   # several copies: tell them apart
             if callable(where):
-                entry.update(moving=True, path=where, procs=PROCS)
+                entry.update(moving=True, hopping=False, spread=False, path=where, procs=PROCS)
+            elif isinstance(where, (Hop, Spread)):
+                speakers = [_find_speaker(self.table, *pos) for pos in where.positions]
+                procs = {s.analog_proc for s in speakers}
+                if len(procs) > 1:
+                    raise ValueError(f"{entry['name']}: hopping speakers on {procs} -- they must all be "
+                                     'on one RX8 (its buffer reaches only that RX8).')
+                entry.update(moving=False, hopping=isinstance(where, Hop), spread=isinstance(where, Spread),
+                             hop=where, speakers=speakers, procs=(speakers[0].analog_proc,),
+                             rng=numpy.random.default_rng(), current=0, event=0)
             else:
                 speaker = _find_speaker(self.table, *where)
-                entry.update(moving=False, speaker=speaker, procs=(speaker.analog_proc,))
-            entry['data'] = numpy.asarray(entry['sound'].data, dtype=float).flatten()
-            entry['peak'] = numpy.abs(entry['data']).max()
-            if len(entry['data']) > BUFFER_SIZE:
-                raise ValueError(f"{entry['name']} is {len(entry['data'])} samples, the buffers hold "
+                entry.update(moving=False, hopping=False, spread=False, speaker=speaker,
+                             procs=(speaker.analog_proc,))
+            data = numpy.asarray(entry['sound'].data, dtype=float).flatten()
+            if len(data) > BUFFER_SIZE:
+                raise ValueError(f"{entry['name']} is {len(data)} samples, the buffers hold "
                                  f'{BUFFER_SIZE}. Raise BUFFER_SIZE and the SerialBuf Size.')
+            entry['n_samples'] = len(data)
+            entry['data'] = _fill_buffer(data, gap=options.get('gap'), snippet=options.get('snippet'),
+                                         seed=GAP_SEED + n_sound)
+            entry['peak'] = numpy.abs(entry['data']).max()
+            if entry['hopping']:
+                entry['starts'], entry['ends'] = _events(entry['data'])
+                entry['current'] = int(entry['rng'].integers(len(entry['speakers'])))
             if entry['peak'] >= 1:  # +-1 is +-10 V on the RX8 DAC
                 logging.warning('%s peaks at %.2f (>= 1): lower its level or it will clip.',
                                 entry['name'], entry['peak'])
@@ -238,15 +398,19 @@ class DomeDemo:
         self._assign_buffers()
         self._written = {}      # (proc, buffer, channel) -> last gain written
         self._t0 = None
+        self._fs = SAMPLERATE   # the RX8's exact rate, read in init_processors
+        self._verbose = False   # 'v' in the console: print every jump of a hopping sound
         for proc in PROCS:
             n = N_MOVING + len(STATIC_WIRING[proc])
             logging.info('%s: %d buffers x %d samples = %.0f MB at %d Hz.',
                          proc, n, BUFFER_SIZE, n * BUFFER_SIZE * 4 / 1e6, SAMPLERATE)
 
     def _check_positions(self):
-        static = [s['speaker'].index for s in self.sounds if not s['moving']]
-        if len(static) != len(set(static)):
-            raise ValueError('Two static sounds share a speaker.')
+        multi = [s for s in self.sounds if s['hopping'] or s['spread']]
+        used = [s['speaker'].index for s in self.sounds if not s['moving'] and s not in multi]
+        used += [spk.index for s in multi for spk in s['speakers']]
+        if len(used) != len(set(used)):
+            raise ValueError('Two static/hopping sounds share a speaker.')
 
     def _assign_buffers(self):
         """Moving sounds take buffers 1..N_MOVING on both RX8s; a static sound takes the
@@ -259,8 +423,18 @@ class DomeDemo:
         for entry in self.sounds:
             if entry['moving']:
                 continue
+            if entry['hopping'] or entry['spread']:
+                proc = entry['procs'][0]
+                channels = {spk.analog_channel for spk in entry['speakers']}
+                match = [i for i, c in STATIC_WIRING[proc].items()
+                         if isinstance(c, list) and set(c) == channels]
+                if not match:
+                    raise ValueError(f"{entry['name']}: no buffer on {proc} is wired to exactly the "
+                                     f'channels {sorted(channels)}. Wired: {STATIC_WIRING[proc]}.')
+                entry['buffer'] = match[0]
+                continue
             speaker = entry['speaker']
-            wired = {c: i for i, c in STATIC_WIRING[speaker.analog_proc].items()}
+            wired = {c: i for i, c in STATIC_WIRING[speaker.analog_proc].items() if not isinstance(c, list)}
             if speaker.analog_channel not in wired:
                 raise ValueError(
                     f"{entry['name']}: no static buffer on {speaker.analog_proc} is wired to channel "
@@ -280,6 +454,7 @@ class DomeDemo:
             if abs(rate - SAMPLERATE) > 1:
                 raise RuntimeError(f'{proc} runs at {rate:.0f} Hz but SAMPLERATE is {SAMPLERATE}. '
                                    'Compile the circuit at that rate.')
+            self._fs = rate
 
     def load(self):
         """Write all buffers, lengths and initial gains. Call while the demo is stopped."""
@@ -288,17 +463,25 @@ class DomeDemo:
             for entry in self.sounds:
                 if proc in entry['procs']:
                     i = entry['buffer']
+                    t_write = time.monotonic()
                     freefield.write(f'sigin{i}', entry['data'], proc)
-                    freefield.write(f'len{i}', len(entry['data']), proc)
+                    logging.info('%s: %-15s -> sigin%d (%d samples, %.1f s)', proc, entry['name'], i,
+                                 len(entry['data']), time.monotonic() - t_write)
         self._written.clear()
         self.update_gains(t=0.0, force=True)
         for entry in self.sounds:
-            where = ('moving' if entry['moving'] else
-                     f"speaker {entry['speaker'].index:2d} (az {entry['speaker'].azimuth:g}, "
-                     f"el {entry['speaker'].elevation:g})")
-            logging.info('%-8s buffer %d on %s | %6.2f s | %d dB | %s', entry['name'],
+            if entry['moving']:
+                where = 'moving'
+            elif entry['hopping']:
+                where = f"hopping over {len(entry['speakers'])} speakers, {len(entry['starts'])} calls"
+            elif entry['spread']:
+                where = f"spread over {len(entry['speakers'])} speakers"
+            else:
+                where = (f"speaker {entry['speaker'].index:2d} (az {entry['speaker'].azimuth:g}, "
+                         f"el {entry['speaker'].elevation:g})")
+            logging.info('%-15s buffer %d on %s | %6.2f s | %d dB | %s', entry['name'],
                          entry['buffer'], '+'.join(entry['procs']),
-                         len(entry['data']) / SAMPLERATE, entry['level'], where)
+                         entry['n_samples'] / SAMPLERATE, entry['level'], where)
 
     @staticmethod
     def _zbus(trigger, kind):
@@ -322,10 +505,22 @@ class DomeDemo:
         """{(proc, tag): gain} for every gain tag in the circuits, at scene time t."""
         gains = {(proc, f'aSig{i}_Ch{c}'): 0.0 for proc in PROCS
                  for i in range(1, N_MOVING + 1) for c in range(1, N_CHANNELS + 1)}
-        gains.update({(proc, f'amp{i}'): 0.0 for proc in PROCS for i in STATIC_WIRING[proc]})
+        for proc in PROCS:
+            for i, channels in STATIC_WIRING[proc].items():
+                if isinstance(channels, list):
+                    gains.update({(proc, f'amp{i}_Ch{c}'): 0.0 for c in channels})
+                else:
+                    gains[(proc, f'amp{i}')] = 0.0
         for entry in self.sounds:
             scale = 0.0 if entry['muted'] else 10 ** (entry['offset'] / 20)
-            if entry['moving']:
+            if entry['hopping']:
+                speaker = entry['speakers'][entry['current']]
+                gains[(speaker.analog_proc, f"amp{entry['buffer']}_Ch{speaker.analog_channel}")] = scale
+            elif entry['spread']:   # equal power over all its speakers
+                for speaker in entry['speakers']:
+                    gains[(speaker.analog_proc, f"amp{entry['buffer']}_Ch{speaker.analog_channel}")] = \
+                        scale / math.sqrt(len(entry['speakers']))
+            elif entry['moving']:
                 weights = pan_weights(*entry['path'](t), self.speaker_vectors) * scale
                 for speaker, w in zip(self.table, weights):
                     gains[(speaker.analog_proc, f"aSig{entry['buffer']}_Ch{speaker.analog_channel}")] = w
@@ -333,8 +528,33 @@ class DomeDemo:
                 gains[(entry['speaker'].analog_proc, f"amp{entry['buffer']}")] = scale
         return gains
 
+    def _update_hops(self, t):
+        """In the pause before each call of a hopping sound, choose its next speaker.
+
+        The position in the buffer follows from the time since start() at the RX8's
+        exact rate (all buffers start in the same sample and wrap at BUFFER_SIZE).
+        """
+        pos = int(t * self._fs) % BUFFER_SIZE
+        for entry in self.sounds:
+            if not entry['hopping']:
+                continue
+            starts, ends = entry['starts'], entry['ends']
+            k = int(numpy.searchsorted(starts, pos, side='right')) - 1   # last call that started
+            if k >= 0 and pos < ends[k]:
+                continue                                  # inside a call: never jump
+            upcoming = (k + 1) % len(starts)
+            if entry['event'] != upcoming:
+                entry['event'] = upcoming
+                entry['current'] = entry['hop'].choose(entry['current'], entry['hop'].positions,
+                                                       entry['rng'])
+                if self._verbose and not entry['muted']:
+                    az, el = entry['hop'].positions[entry['current']]
+                    print(f"  {entry['name']} -> az {az:g}, el {el:g}")
+
     def update_gains(self, t, force=False):
         """Write the gains that changed since the last call; returns the number of writes."""
+        if self._t0 is not None:
+            self._update_hops(t)
         n = 0
         for key, gain in self._target_gains(t).items():
             last = self._written.get(key)
@@ -353,13 +573,18 @@ class DomeDemo:
         if entry['peak'] * 10 ** (new_offset / 20) >= 1:
             print(f"  {entry['name']} would clip at {entry['level'] + new_offset:g} dB -- not changed.")
             return
+        old = entry['level'] + entry['offset']
         entry['offset'] = new_offset
+        print(f"  {entry['name']}: {old:g} -> {entry['level'] + new_offset:g} dB"
+              f"{'  (still muted)' if entry['muted'] else ''}")
 
     def print_levels(self):
         """Current levels -- copy the numbers into SOUNDS."""
         for i, entry in enumerate(self.sounds, start=1):
-            print(f"  {i:2d} {entry['name']:8s} {entry['level'] + entry['offset']:5g} dB"
-                  f"{'  moving' if entry['moving'] else ''}{'  (muted)' if entry['muted'] else ''}")
+            print(f"  {i:2d} {entry['name']:15s} {entry['level'] + entry['offset']:5g} dB"
+                  f"{'  moving' if entry['moving'] else ''}{'  hopping' if entry['hopping'] else ''}"
+                  f"{'  spread' if entry['spread'] else ''}"
+                  f"{'  (muted)' if entry['muted'] else ''}")
 
     # ------------------------------------------------------------ run
     def run(self):
@@ -373,7 +598,7 @@ class DomeDemo:
         self.start()
         help_text = (f'Commands:  <n>  mute/unmute sound n (1-{len(self.sounds)})  |  '
                      '<n> <dB>  e.g. "6 -3" turns sound 6 down by 3 dB  |  '
-                     'a all on | m all off | l levels | s stop | p play | q quit')
+                     'a all on | m all off | l levels | v hop printout | s stop | p play | q quit')
         print(help_text)
         self.print_levels()
         commands = queue.Queue()
@@ -398,33 +623,42 @@ class DomeDemo:
             self.stop()
 
     def _command(self, line, help_text):
-        """Handle one console line; returns False to quit."""
+        """Handle one console line, print what changed; returns False to quit."""
         parts = line.strip().lower().split()
         if not parts:
             return True
         command = parts[0]
         if command == 'q':
+            print('  quit')
             return False
         elif command == 's':
             self.stop()
+            print('  stopped')
         elif command == 'p':
             self.start()
+            print('  playing (all buffers from the start)')
         elif command in ('a', 'm'):
             for entry in self.sounds:
                 entry['muted'] = command == 'm'
+            print(f"  all {len(self.sounds)} sounds {'muted' if command == 'm' else 'on'}")
         elif command == 'l':
             self.print_levels()
+        elif command == 'v':
+            self._verbose = not self._verbose
+            print(f"  hop printout {'on' if self._verbose else 'off'}")
         elif command.isdigit() and 1 <= int(command) <= len(self.sounds):
             index = int(command) - 1
+            entry = self.sounds[index]
             if len(parts) == 1:
-                self.sounds[index]['muted'] = not self.sounds[index]['muted']
+                entry['muted'] = not entry['muted']
+                state = 'muted' if entry['muted'] else f"on ({entry['level'] + entry['offset']:g} dB)"
+                print(f"  {entry['name']}: {state}")
             else:
                 try:
                     self.adjust(index, float(parts[1]))
                 except ValueError:
                     print(help_text)
                     return True
-            self.print_levels()
         else:
             print(help_text)
         if self._t0 is None:  # stopped: still apply mutes and levels for the next start
