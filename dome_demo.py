@@ -18,14 +18,14 @@ and a channel that is wired in the circuit.
       sigin{i}         SerSource buffer, Size = BUFFER_SIZE, loops
       len{i}           buffer i wraps back to 0 after len{i} samples
       aSig{i}_Ch{c}    gain of buffer i on channel c = 1..24, smoothed (as in Marc's circuit)
-    buffers N_MOVING+1.. (per RX8, see STATIC_WIRING) -- static sounds
+    buffers in STATIC_WIRING (per RX8) -- static sounds
       sigin{i}, len{i} as above
       amp{i}           gain of buffer i, smoothed; output added to ONE channel, wired in the circuit
     per channel c      sum of everything routed to c -> one DacOut c
                        (one DacOut per channel: TDT does not document what two DacOuts
                        on the same channel do)
-    zBusA (pulse)      reset all buffer indices to 0 and start (set an RSFlipFlop)
-    zBusB (pulse)      stop (reset the RSFlipFlop)
+    zBusA (level)      SerialBuf AccEnab: high = play, low = stop (as in Marc's circuit)
+    zBusB              SerialBuf Rst: a pulse resets every buffer index to 0
 
 STATIC_WIRING is the wiring of the static buffers; the script checks every static
 sound against it. A static sound on a speaker that has no wired buffer can be made
@@ -86,9 +86,9 @@ SOUNDS = [
     ('chimes3.wav', (17.5, 25), 53),
     ('cat.wav', (17.5, -12.5), 52),                                      # target
     ('motor.wav', (35, -25), 54),
+    ('train_s.wav', (52.5, 0), 53),                                      # far right, on the horizon
     ('geese.wav', ping_pong((-52.5, 30), (52.5, 30), period=24), 57),    # fly over, left <-> right
     ('birds.wav', orbit((0, 25), (40, 10), period=30), 56),              # circle up high
-    ('train_s.wav', ping_pong((-52.5, 0), (52.5, 0), period=38), 53),    # pass along the horizon
     # ('train.wav', ...) -- 184 s: a buffer that long does not fit 8 times into the RX8
     #                       memory; train_s.wav is Marc's trimmed version of it.
 ]
@@ -102,11 +102,12 @@ LOOP_RAMP = 0.005       # s, raised-cosine ramp at both ends of each sound, so t
 # Fixed in the circuit -- these must match it (see the docstring):
 SAMPLERATE = 48828      # the wavs are 22.05 kHz (content up to 11 kHz); at 24414 Hz the
                         # RX8 DAC filter would already roll off near 11 kHz
-N_MOVING = 3            # buffers 1..3 on both RX8s: sigin, len, aSig{i}_Ch1..24
+N_MOVING = 2            # buffers 1..2 on both RX8s: sigin, len, aSig{i}_Ch1..24
+                        # (3 x 24 gain cells do not fit on two 2-DSP RX8s: >256 components/DSP)
 N_CHANNELS = 24         # aSig{i}_Ch1..24
 STATIC_WIRING = {       # static buffer -> the DAC channel it is wired to in that RX8's circuit
-    'RX81': {4: 11, 5: 4, 6: 20, 7: 8, 8: 21},   # chimes, chimes2, chimes3, cat, motor
-    'RX82': {4: 18, 5: 2},                         # ocean, cows
+    'RX81': {4: 11, 5: 4, 6: 20, 7: 8, 8: 21},   # chimes, chimes2, chimes3, cat, motor (3 unused)
+    'RX82': {3: 14, 4: 18, 5: 2},                  # train_s, ocean, cows
 }
 BUFFER_SIZE = 2100000   # SerSource Size; cows.wav (42 s) is the longest sound: 2.05 M at 48828 Hz
 RCX_FILES = {'RX81': 'scene_RX81.rcx', 'RX82': 'scene_RX82.rcx'}
@@ -296,12 +297,21 @@ class DomeDemo:
                          entry['buffer'], '+'.join(entry['procs']),
                          len(entry['data']) / SAMPLERATE, entry['level'], where)
 
+    @staticmethod
+    def _zbus(trigger, kind):
+        """zBus trigger to both RX8s. kind: 0 = pulse, 1 = high, 2 = low (as in Marc's script)."""
+        zbus = freefield_core.PROCESSORS._zbus
+        (zbus.zBusTrigA if trigger == 'A' else zbus.zBusTrigB)(0, kind, 10)
+
     def start(self):
-        freefield.play(kind='zBusA')  # both RX8s: indices to 0 and run, in the same sample
+        """All buffers back to sample 0, then play -- on both RX8s in the same sample."""
+        self._zbus('A', 2)  # AccEnab low
+        self._zbus('B', 0)  # Rst pulse: indices to 0
+        self._zbus('A', 1)  # AccEnab high: play
         self._t0 = time.monotonic()
 
     def stop(self):
-        freefield.play(kind='zBusB')
+        self._zbus('A', 2)
         self._t0 = None
 
     # ------------------------------------------------------------ gains
