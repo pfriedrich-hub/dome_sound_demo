@@ -8,26 +8,29 @@ as in Marc's old RX8_play_multichannel script. One zBus trigger starts all
 buffers on both RX8s in the same sample. While the demo runs, each sound can be
 muted or turned up/down from the console.
 
-Circuit: rcx/24ch_8Sig_loop.rcx = Marc's rcx/24ch_8Sig.rcx, extended
---------------------------------------------------------------------
-Loaded on RX81 and RX82. What Marc's circuit has (read from the .rcx):
+Circuits: rcx/scene_RX81.rcx and rcx/scene_RX82.rcx (one per RX8, RX8-2, 48828 Hz)
+------------------------------------------------------------------------------
+Trimmed from Marc's 24ch_8Sig.rcx (8 x 24 gains on 6 DSPs) to fit two 2-DSP RX8s:
+only the moving sounds get a gain on every channel, static sounds get one gain
+and a channel that is wired in the circuit.
 
-    sigin{i}          i = 1..8   looping SerialBuf, Size 360000 in the original
-    aSig{i}_Ch{c}     c = 1..24  gain of buffer i on DAC channel c (smoothed in the circuit)
-    idx{i}                       read index of buffer i (not used here)
-    zBusA / zBusB                run / reset (trigger sequence copied from Marc's script)
+    buffers 1..N_MOVING (both RX8s) -- moving sounds
+      sigin{i}         SerSource buffer, Size = BUFFER_SIZE, loops
+      len{i}           buffer i wraps back to 0 after len{i} samples
+      aSig{i}_Ch{c}    gain of buffer i on channel c = 1..24, smoothed (as in Marc's circuit)
+    buffers N_MOVING+1.. (per RX8, see STATIC_WIRING) -- static sounds
+      sigin{i}, len{i} as above
+      amp{i}           gain of buffer i, smoothed; output added to ONE channel, wired in the circuit
+    per channel c      sum of everything routed to c -> one DacOut c
+                       (one DacOut per channel: TDT does not document what two DacOuts
+                       on the same channel do)
+    zBusA (pulse)      reset all buffer indices to 0 and start (set an RSFlipFlop)
+    zBusB (pulse)      stop (reset the RSFlipFlop)
 
-What has to be changed in RPvdsEx, saved as 24ch_8Sig_loop.rcx (the script relies on it):
-
-    1. Size of every SerialBuf = BUFFER_SIZE (2.1 M samples, the longest sound)
-    2. new tag len{i}: buffer i wraps back to 0 after len{i} samples, so each
-       sound loops at its own length (e.g. compare idx{i} with len{i} -> reset)
-    3. compile at SAMPLERATE = 48828 Hz (checked by the script after loading)
-
-Buffers: a buffer reaches only the 24 channels of its own RX8. A moving sound is
-therefore loaded into the same buffer number on BOTH RX8s; a static sound only
-on the RX8 of its speaker. Per RX8: n_moving + n_static_on_that_rx8 <= 8.
-Memory: 8 x BUFFER_SIZE floats per RX8 = 67 MB of the RX8's 128 MB.
+STATIC_WIRING is the wiring of the static buffers; the script checks every static
+sound against it. A static sound on a speaker that has no wired buffer can be made
+a moving sound with a fixed position instead (path=lambda t: (az, el)).
+Memory: buffers x BUFFER_SIZE floats per RX8 (logged at startup), of 128 MB.
 """
 # %% imports
 import logging
@@ -99,10 +102,14 @@ LOOP_RAMP = 0.005       # s, raised-cosine ramp at both ends of each sound, so t
 # Fixed in the circuit -- these must match it (see the docstring):
 SAMPLERATE = 48828      # the wavs are 22.05 kHz (content up to 11 kHz); at 24414 Hz the
                         # RX8 DAC filter would already roll off near 11 kHz
-N_BUFFERS = 8           # sigin1..8 per RX8
+N_MOVING = 3            # buffers 1..3 on both RX8s: sigin, len, aSig{i}_Ch1..24
 N_CHANNELS = 24         # aSig{i}_Ch1..24
-BUFFER_SIZE = 2100000   # SerialBuf Size; cows.wav (42 s) is the longest sound: 2.05 M at 48828 Hz
-RCX_FILE = '24ch_8Sig_loop.rcx'   # Marc's 24ch_8Sig.rcx with the changes in the docstring
+STATIC_WIRING = {       # static buffer -> the DAC channel it is wired to in that RX8's circuit
+    'RX81': {4: 11, 5: 4, 6: 20, 7: 8, 8: 21},   # chimes, chimes2, chimes3, cat, motor
+    'RX82': {4: 18, 5: 2},                         # ocean, cows
+}
+BUFFER_SIZE = 2100000   # SerSource Size; cows.wav (42 s) is the longest sound: 2.05 M at 48828 Hz
+RCX_FILES = {'RX81': 'scene_RX81.rcx', 'RX82': 'scene_RX82.rcx'}
 RCX_DIR = Path(__file__).resolve().parent / 'rcx'
 PROCESSOR_MODE = 'dome_demo'
 PROCS = ('RX81', 'RX82')
@@ -111,14 +118,12 @@ MIN_CHANGE = 0.002      # a gain is only rewritten when it changed by more than 
 
 
 # %% helpers
-def _circuit():
-    """Path of the circuit: ./rcx first, then the freefield package."""
-    candidates = [RCX_DIR / RCX_FILE, Path(freefield.DIR) / 'data' / 'rcx' / RCX_FILE]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError(f'Could not find {RCX_FILE}. Looked in: '
-                            + ', '.join(str(c) for c in candidates))
+def _circuit(proc):
+    """Path of the circuit for `proc`, in ./rcx."""
+    path = RCX_DIR / RCX_FILES[proc]
+    if not path.exists():
+        raise FileNotFoundError(f'Could not find the {proc} circuit {path}.')
+    return str(path)
 
 
 Speaker = namedtuple('Speaker', 'index analog_channel analog_proc azimuth elevation')
@@ -229,8 +234,10 @@ class DomeDemo:
         self._assign_buffers()
         self._written = {}      # (proc, buffer, channel) -> last gain written
         self._t0 = None
-        logging.info('Memory per RX8: %d buffers x %d samples = %.0f MB at %d Hz.',
-                     N_BUFFERS, BUFFER_SIZE, N_BUFFERS * BUFFER_SIZE * 4 / 1e6, SAMPLERATE)
+        for proc in PROCS:
+            n = N_MOVING + len(STATIC_WIRING[proc])
+            logging.info('%s: %d buffers x %d samples = %.0f MB at %d Hz.',
+                         proc, n, BUFFER_SIZE, n * BUFFER_SIZE * 4 / 1e6, SAMPLERATE)
 
     def _check_positions(self):
         static = [s['speaker'].index for s in self.sounds if not s['moving']]
@@ -238,24 +245,30 @@ class DomeDemo:
             raise ValueError('Two static sounds share a speaker.')
 
     def _assign_buffers(self):
-        """Moving sounds take buffers 1..M on both RX8s; static sounds fill the rest of their RX8."""
+        """Moving sounds take buffers 1..N_MOVING on both RX8s; a static sound takes the
+        buffer that STATIC_WIRING connects to its speaker's channel."""
         moving = [s for s in self.sounds if s['moving']]
+        if len(moving) > N_MOVING:
+            raise ValueError(f'{len(moving)} moving sounds, the circuits have {N_MOVING} moving buffers.')
         for i, entry in enumerate(moving, start=1):
             entry['buffer'] = i
-        for proc in PROCS:
-            static = [s for s in self.sounds if not s['moving'] and s['procs'] == (proc,)]
-            n_used = len(moving) + len(static)
-            if n_used > N_BUFFERS:
-                raise ValueError(f'{proc} would need {n_used} buffers ({len(moving)} moving + '
-                                 f'{len(static)} static), the circuit has {N_BUFFERS}.')
-            for i, entry in enumerate(static, start=len(moving) + 1):
-                entry['buffer'] = i
+        for entry in self.sounds:
+            if entry['moving']:
+                continue
+            speaker = entry['speaker']
+            wired = {c: i for i, c in STATIC_WIRING[speaker.analog_proc].items()}
+            if speaker.analog_channel not in wired:
+                raise ValueError(
+                    f"{entry['name']}: no static buffer on {speaker.analog_proc} is wired to channel "
+                    f'{speaker.analog_channel} (speaker {speaker.index}). Wired: '
+                    f'{STATIC_WIRING[speaker.analog_proc]}. Rewire the circuit or make it a moving '
+                    'sound with a fixed position.')
+            entry['buffer'] = wired[speaker.analog_channel]
 
     # ------------------------------------------------------------ processors
     def init_processors(self):
         if freefield_core.PROCESSORS is None or freefield_core.PROCESSORS.mode != PROCESSOR_MODE:
-            circuit = _circuit()
-            freefield.initialize('dome', device=[[proc, 'RX8', circuit] for proc in PROCS],
+            freefield.initialize('dome', device=[[proc, 'RX8', _circuit(proc)] for proc in PROCS],
                                  zbus=True, sensor_tracking=False)
             freefield_core.PROCESSORS.mode = PROCESSOR_MODE
         for proc in PROCS:  # the rate is fixed by the .rcx; a wrong one plays at the wrong pitch
@@ -264,15 +277,9 @@ class DomeDemo:
                 raise RuntimeError(f'{proc} runs at {rate:.0f} Hz but SAMPLERATE is {SAMPLERATE}. '
                                    'Compile the circuit at that rate.')
 
-    @staticmethod
-    def _zbus(trigger, kind):
-        """kind: 1 = high, 2 = low (as in Marc's script)."""
-        zbus = freefield_core.PROCESSORS._zbus
-        (zbus.zBusTrigA if trigger == 'A' else zbus.zBusTrigB)(0, kind, 10)
-
     def load(self):
         """Write all buffers, lengths and initial gains. Call while the demo is stopped."""
-        self._zbus('B', 1)  # hold the buffers in reset while loading
+        self.stop()
         for proc in PROCS:
             for entry in self.sounds:
                 if proc in entry['procs']:
@@ -281,7 +288,6 @@ class DomeDemo:
                     freefield.write(f'len{i}', len(entry['data']), proc)
         self._written.clear()
         self.update_gains(t=0.0, force=True)
-        self._zbus('B', 2)
         for entry in self.sounds:
             where = ('moving' if entry['moving'] else
                      f"speaker {entry['speaker'].index:2d} (az {entry['speaker'].azimuth:g}, "
@@ -291,38 +297,37 @@ class DomeDemo:
                          len(entry['data']) / SAMPLERATE, entry['level'], where)
 
     def start(self):
-        self._zbus('A', 2)
-        time.sleep(0.5)     # zBus trigger latency (Marc's note, RPvdsEx help)
-        self._zbus('A', 1)  # both RX8s start reading in the same sample
+        freefield.play(kind='zBusA')  # both RX8s: indices to 0 and run, in the same sample
         self._t0 = time.monotonic()
 
     def stop(self):
-        self._zbus('A', 2)
+        freefield.play(kind='zBusB')
         self._t0 = None
 
     # ------------------------------------------------------------ gains
     def _target_gains(self, t):
-        """{(proc, buffer, channel): gain} for every buffer and channel, at scene time t."""
-        gains = {(proc, i, c): 0.0 for proc in PROCS
-                 for i in range(1, N_BUFFERS + 1) for c in range(1, N_CHANNELS + 1)}
+        """{(proc, tag): gain} for every gain tag in the circuits, at scene time t."""
+        gains = {(proc, f'aSig{i}_Ch{c}'): 0.0 for proc in PROCS
+                 for i in range(1, N_MOVING + 1) for c in range(1, N_CHANNELS + 1)}
+        gains.update({(proc, f'amp{i}'): 0.0 for proc in PROCS for i in STATIC_WIRING[proc]})
         for entry in self.sounds:
             scale = 0.0 if entry['muted'] else 10 ** (entry['offset'] / 20)
             if entry['moving']:
                 weights = pan_weights(*entry['path'](t), self.speaker_vectors) * scale
                 for speaker, w in zip(self.table, weights):
-                    gains[(speaker.analog_proc, entry['buffer'], speaker.analog_channel)] = w
+                    gains[(speaker.analog_proc, f"aSig{entry['buffer']}_Ch{speaker.analog_channel}")] = w
             else:
-                speaker = entry['speaker']
-                gains[(speaker.analog_proc, entry['buffer'], speaker.analog_channel)] = scale
+                gains[(entry['speaker'].analog_proc, f"amp{entry['buffer']}")] = scale
         return gains
 
     def update_gains(self, t, force=False):
         """Write the gains that changed since the last call; returns the number of writes."""
         n = 0
         for key, gain in self._target_gains(t).items():
-            if force or abs(self._written.get(key, -1.0) - gain) > MIN_CHANGE or (gain == 0) != (self._written.get(key) == 0):
-                proc, i, c = key
-                freefield_core.PROCESSORS.processors[proc].SetTagVal(f'aSig{i}_Ch{c}', float(gain))
+            last = self._written.get(key)
+            if force or last is None or abs(last - gain) > MIN_CHANGE or (gain == 0) != (last == 0):
+                proc, tag = key
+                freefield_core.PROCESSORS.processors[proc].SetTagVal(tag, float(gain))
                 self._written[key] = gain
                 n += 1
         return n
