@@ -124,6 +124,7 @@ def scatter():
 #                          drawn at random -- a short call then does not repeat at a fixed rhythm.
 #   'snippet': (min, max)  instead of the whole file, play random excerpts of min..max s
 #                          (faded in and out), each followed by a 'gap'.
+#   'highpass': Hz         high-pass filter the file first (e.g. to remove background noise).
 # A file can appear more than once (e.g. at several speakers); every copy gets its own
 # random excerpts and pauses.
 # The level is the ACTIVE level: the RMS over the parts where the sound is on (100 ms
@@ -133,7 +134,8 @@ def scatter():
 # These levels are a starting point -- balance them by ear in the dome with the
 # console (e.g. '6 -2'), then copy the values the console prints back here.
 SOUND_DIR = Path(__file__).resolve().parent / 'sounds'   # wav paths are relative to this
-BIRDS = {'snippet': (2, 5), 'gap': (8, 25)}               # options shared by the five bird copies
+BIRDS = {'snippet': (2, 5), 'gap': (8, 25),               # options shared by the five bird copies
+         'highpass': 1000}   # birds.wav has a cow mooing at ~9.8-10.2 s (f0 ~120 Hz): filter it out
 MOVE_PERIOD = 90        # s, one round trip of geese and train (one crossing = half of it)
 CAT = Hop([(-35, -37.5), (-35, -25), (-35, -12.5), (-35, 0), (-35, 12.5), (-35, 25), (-35, 37.5),
            (-52.5, -12.5), (-52.5, 0), (-17.5, -37.5), (-17.5, -25), (-17.5, -12.5)],
@@ -280,13 +282,15 @@ def _active_level(sound, window=0.1):
     return sound.level + 20 * numpy.log10(active_rms / numpy.sqrt((data ** 2).mean()))
 
 
-def _load_sound(file, level):
+def _load_sound(file, level, highpass=None):
     """Load a whole wav as a mono sound at the TDT rate, with its active level set to `level`."""
     sound = slab.Sound(_wav_path(file))
     if sound.n_channels > 1:  # freefield flattens 2-D arrays, which would interleave the channels
         sound = slab.Sound(sound.data.mean(axis=1), samplerate=sound.samplerate)
     if sound.samplerate != SAMPLERATE:
         sound = sound.resample(SAMPLERATE)
+    if highpass:
+        sound = sound.filter(frequency=highpass, kind='hp')
     sound.level = level + MASTER_GAIN + sound.level - _active_level(sound)
     if LOOP_RAMP:
         sound = sound.ramp(duration=LOOP_RAMP)
@@ -361,7 +365,7 @@ class DomeDemo:
         for n_sound, (file, where, level, *options) in enumerate(sounds):
             options = options[0] if options else {}
             entry = {'name': Path(file).stem, 'level': level, 'offset': 0.0, 'muted': False,
-                     'sound': _load_sound(file, level)}
+                     'sound': _load_sound(file, level, highpass=options.get('highpass'))}
             if [f for f, *_ in sounds].count(file) > 1 and not callable(where):
                 entry['name'] += f'@{where[0]:g},{where[1]:g}'   # several copies: tell them apart
             if callable(where):
